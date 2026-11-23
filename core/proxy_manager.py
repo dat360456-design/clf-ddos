@@ -4,14 +4,19 @@ from dataclasses import dataclass
 
 import httpx
 
-
+# Đã bổ sung thêm nhiều nguồn chất lượng cao
 PROXY_SOURCES = [
+    # Nguồn cũ
     "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
-    "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt",
     "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
-    "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/http.txt",
+    
+    # Nguồn mới, cập nhật liên tục
+    "https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/http.txt",
+    "https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/socks5.txt",
+    "https://raw.githubusercontent.com/proxy-free/free-proxy-list/main/socks5.txt",
+    "https://proxy-scraper.de/all.txt", 
+    "https://raw.githubusercontent.com/theriturajps/proxy-list/main/proxies.txt",
 ]
-
 
 @dataclass
 class Proxy:
@@ -26,25 +31,37 @@ class Proxy:
 
 
 class ProxyManager:
-    def __init__(self, test_url="http://httpbin.org/ip", timeout=8):
+    def __init__(self, test_url="http://httpbin.org/ip", timeout=10):
         self.proxies: list[Proxy] = []
         self.test_url = test_url
         self.timeout = timeout
         self._lock = asyncio.Lock()
         self._cursor = 0
 
+    def _parse_proxy_line(self, line: str) -> Proxy | None:
+        line = line.strip()
+        if not line or line.startswith("#") or ":" not in line:
+            return None
+        
+        scheme = "http" # Mặc định là http nếu không có tiền tố
+        
+        if line.startswith("socks5://"):
+            scheme, line = "socks5", line[9:]
+        elif line.startswith("socks4://"):
+            scheme, line = "socks4", line[9:]
+        elif line.startswith("https://"):
+            scheme, line = "https", line[8:]
+        elif line.startswith("http://"):
+            scheme, line = "http", line[7:]
+            
+        return Proxy(address=line, scheme=scheme)
+
     def load_from_file(self, path):
         with open(path) as f:
             for line in f:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                scheme = "http"
-                if line.startswith("socks5://"):
-                    scheme, line = "socks5", line[9:]
-                elif line.startswith("http://"):
-                    line = line[7:]
-                self.proxies.append(Proxy(address=line, scheme=scheme))
+                p = self._parse_proxy_line(line)
+                if p:
+                    self.proxies.append(p)
         print(f"[+] Loaded {len(self.proxies)} proxies from {path}")
 
     async def scrape_free_proxies(self):
@@ -55,23 +72,28 @@ class ProxyManager:
                     r = await client.get(src)
                     n = 0
                     for line in r.text.splitlines():
-                        line = line.strip()
-                        if not line or ":" not in line or line in seen:
-                            continue
-                        self.proxies.append(Proxy(address=line))
-                        seen.add(line)
-                        n += 1
-                    print(f"[+] {src.split('/')[-1]}: +{n}")
+                        p = self._parse_proxy_line(line)
+                        if p and p.address not in seen:
+                            self.proxies.append(p)
+                            seen.add(p.address)
+                            n += 1
+                    print(f"[+] {src.split('/')[-1]}: +{n} proxies")
                 except Exception as e:
-                    print(f"[!] {src}: {e}")
-        print(f"[+] Total: {len(self.proxies)}")
+                    print(f"[!] Lỗi tải {src}: {e}")
+        print(f"[+] Tổng cộng thu thập được: {len(self.proxies)} proxies")
 
-    async def validate(self, workers=150, max_latency=5.0):
-        print(f"[*] Validating {len(self.proxies)} proxies ({workers} workers)...")
+    async def validate(self, workers=300, max_latency=5.0):
+        """
+        Tăng workers lên 300 để quét nhanh hơn. 
+        Lưu ý: Trên a-Shell (iOS) nên giảm xuống 100-150 để tránh treo máy.
+        """
+        print(f"[*] Đang kiểm tra {len(self.proxies)} proxies ({workers} luồng)...")
         sem = asyncio.Semaphore(workers)
         healthy = []
+        checked = 0
 
         async def check(p: Proxy):
+            nonlocal checked
             async with sem:
                 t0 = time.time()
                 try:
@@ -86,11 +108,17 @@ class ProxyManager:
                                 return
                 except Exception:
                     pass
-                p.healthy = False
+                finally:
+                    p.healthy = False
+                    checked += 1
+                    if checked % 500 == 0:
+                        print(f"    ... đã quét {checked}/{len(self.proxies)}")
 
-        await asyncio.gather(*[check(p) for p in self.proxies])
+        # Dùng return_exceptions=True để tránh lỗi crash toàn bộ nếu 1 proxy lỗi
+        await asyncio.gather(*[check(p) for p in self.proxies], return_exceptions=True)
+        
         self.proxies = sorted(healthy, key=lambda x: x.latency)
-        print(f"[+] Healthy: {len(self.proxies)}")
+        print(f"[+] Số proxy sống: {len(self.proxies)}")
         return self.proxies
 
     async def get(self):
